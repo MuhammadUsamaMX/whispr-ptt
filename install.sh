@@ -13,7 +13,12 @@ BIN_DIR="/usr/local/bin"
 # Available models (name : HuggingFace URL : size)
 declare -A MODEL_URLS=(
   [tiny.en]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+  [tiny.en-q5_1]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en-q5_1.bin"
   [base.en]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
+  [base.en-q5_1]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en-q5_1.bin"
+  [small.en-q5_1]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en-q5_1.bin"
+  [small.en]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin"
+  [large-v3-turbo-q5_0]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
   [large-v3-turbo]="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 )
 
@@ -56,15 +61,25 @@ info "uinput configured (re-login needed for group change)"
 # ── Pick whisper model ────────────────────────────────────────────────────────
 heading "Select Whisper model"
 echo ""
-echo "  1) tiny.en       ~75 MB   ← fastest, English only, ~100ms transcription"
-echo "  2) base.en       ~140 MB  ← good balance, English only, ~300ms"
-echo "  3) large-v3-turbo ~1.5 GB ← heaviest, multilingual, best accuracy (needs GPU)"
+echo "  1) tiny.en-q5_1  ~32 MB   ← ultra fast, English only, ~50ms"
+echo "  2) tiny.en       ~75 MB   ← fast, English only, ~80ms"
+echo "  3) base.en-q5_1  ~60 MB   ← fast + better accuracy, ~120ms"
+echo "  4) base.en       ~142 MB  ← standard base, ~200ms"
+echo "  5) small.en-q5_1 ~190 MB  ← best speed/accuracy balance ★ recommended"
+echo "  6) small.en      ~488 MB  ← full small, ~700ms"
+echo "  7) large-v3-turbo-q5_0 ~574 MB ← near-best accuracy, ~3s"
+echo "  8) large-v3-turbo ~1.6 GB ← best accuracy (slow without GPU)"
 echo ""
-read -rp "Choose model [1/2/3] (default: 1): " MODEL_CHOICE
-case "${MODEL_CHOICE:-1}" in
-  2) MODEL_KEY="base.en" ;;
-  3) MODEL_KEY="large-v3-turbo" ;;
-  *) MODEL_KEY="tiny.en" ;;
+read -rp "Choose model [1-8] (default: 5): " MODEL_CHOICE
+case "${MODEL_CHOICE:-5}" in
+  1) MODEL_KEY="tiny.en-q5_1" ;;
+  2) MODEL_KEY="tiny.en" ;;
+  3) MODEL_KEY="base.en-q5_1" ;;
+  4) MODEL_KEY="base.en" ;;
+  6) MODEL_KEY="small.en" ;;
+  7) MODEL_KEY="large-v3-turbo-q5_0" ;;
+  8) MODEL_KEY="large-v3-turbo" ;;
+  *) MODEL_KEY="small.en-q5_1" ;;
 esac
 
 sudo mkdir -p "$MODELS_DIR"

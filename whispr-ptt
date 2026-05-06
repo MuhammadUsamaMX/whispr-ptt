@@ -18,7 +18,7 @@ import threading
 import time
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL  = "/usr/local/share/whispr/ggml-base.en.bin"
+MODEL  = "/usr/local/share/whispr/ggml-small.en-q5_1.bin"
 HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
 LIVE_PREVIEW_INTERVAL_SEC = 0.8   # seconds between live typing cycles
