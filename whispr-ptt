@@ -206,6 +206,19 @@ def run_key_listener():
                 _grabbed_devs.append(d)
             except Exception:
                 pass
+        # Wayland started its own compositor-side auto-repeat timer when it saw
+        # the key_down event. Evdev grab stops the kernel sending more events to
+        # libinput, but Wayland's internal timer keeps firing. Cancel it by
+        # injecting a fake key-up for the trigger key (and modifier) via ydotool.
+        # This makes the compositor think the key was released → repeat stops.
+        _uid = os.getuid()
+        _env = os.environ.copy()
+        _env["YDOTOOL_SOCKET"]  = f"/run/user/{_uid}/.ydotool_socket"
+        _env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+        subprocess.Popen(
+            ["ydotool", "key", f"{key_name}:0", f"{mod_name}:0"],
+            env=_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     def ungrab_all():
         global _grabbed_devs
