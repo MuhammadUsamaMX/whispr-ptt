@@ -21,9 +21,11 @@ import time
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
 HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
-LIVE_PREVIEW_INTERVAL_SEC = 1.5   # seconds between live preview runs
-LIVE_PREVIEW_MIN_BYTES = 16000    # ~0.5s of 16kHz s16 mono audio; preview starts early
+LIVE_PREVIEW_INTERVAL_SEC = 1.5   # seconds between live typing cycles
+LIVE_PREVIEW_MIN_BYTES = 16000    # min new bytes before transcribing a chunk (~0.5s)
 TOGGLE_GUARD_SEC = 0.35
+WAV_HDR = 44          # standard PCM WAV header size in bytes
+BYTES_PER_SEC = 32000 # 16kHz * 2 bytes * 1 channel
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -48,7 +50,8 @@ _grabbed_devs    = []   # keyboards grabbed while hotkey is held
 _transcribe_lock = threading.Lock()
 _live_stop_event = threading.Event()
 _live_thread     = None
-_typed_so_far    = ""   # words already typed at cursor during this session
+_typed_so_far    = ""   # text already typed at cursor during this session
+_last_typed_byte = WAV_HDR  # byte offset up to which live worker has already typed
 _transcribing    = False
 
 
@@ -110,8 +113,29 @@ def transcribe(wav_path):
 
 
 def _copy_to_clipboard(text):
-    subprocess.run(["wl-copy",            text], check=False)
+    subprocess.run(["wl-copy",             text], check=False)
     subprocess.run(["wl-copy", "--primary", text], check=False)
+
+
+def _write_wav_chunk(path, raw_pcm):
+    """Write a minimal 16kHz mono s16 PCM WAV file from raw PCM bytes."""
+    import struct
+    data_size = len(raw_pcm)
+    with open(path, 'wb') as f:
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 36 + data_size))
+        f.write(b'WAVE')
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))       # chunk size
+        f.write(struct.pack('<H', 1))        # PCM
+        f.write(struct.pack('<H', 1))        # mono
+        f.write(struct.pack('<I', 16000))    # sample rate
+        f.write(struct.pack('<I', 32000))    # byte rate
+        f.write(struct.pack('<H', 2))        # block align
+        f.write(struct.pack('<H', 16))       # bits per sample
+        f.write(b'data')
+        f.write(struct.pack('<I', data_size))
+        f.write(raw_pcm)
 
 
 def _type_at_cursor(text):
@@ -128,40 +152,9 @@ def _type_at_cursor(text):
     return result.returncode == 0
 
 
-def _new_suffix(full_text, typed_so_far):
-    """Return only the words whisper added since the last chunk we typed.
-
-    Compares word-by-word so minor punctuation changes in earlier words
-    don't cause double-typing.
-    """
-    if not typed_so_far:
-        return full_text
-    typed_words = typed_so_far.split()
-    full_words  = full_text.split()
-    if len(full_words) <= len(typed_words):
-        return ""
-    # Count how many leading words still match (allow punctuation drift)
-    matched = 0
-    for i, w in enumerate(typed_words):
-        if i >= len(full_words):
-            break
-        if full_words[i].lower().rstrip(".,!?;") == w.lower().rstrip(".,!?;"):
-            matched += 1
-        else:
-            break
-    # If whisper significantly revised earlier text, skip this cycle
-    if matched < max(1, len(typed_words) - 2):
-        return ""
-    new_words = full_words[len(typed_words):]
-    if not new_words:
-        return ""
-    prefix = " " if not typed_so_far.endswith(" ") else ""
-    return prefix + " ".join(new_words)
-
-
 # ── Audio recording ───────────────────────────────────────────────────────────
 def start_recording():
-    global recording_proc, audio_file, _live_thread, _typed_so_far
+    global recording_proc, audio_file, _live_thread, _typed_so_far, _last_typed_byte
     fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
     os.close(fd)
     recording_proc = subprocess.Popen(
@@ -169,67 +162,78 @@ def start_recording():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     _live_stop_event.clear()
-    _typed_so_far = ""
+    _typed_so_far    = ""
+    _last_typed_byte = WAV_HDR
     _live_thread = threading.Thread(target=live_typing_worker, args=(audio_file,), daemon=True)
     _live_thread.start()
     log("Recording...")
-    notify("Recording...", urgency="low", timeout=30000, replace_id=9999)
 
 
 def live_typing_worker(src_wav):
-    """While recording: every N seconds snapshot the audio, transcribe it,
-    and immediately type at the cursor any words that are new since the last
-    chunk.  The final stop_and_transcribe() call types whatever remains."""
-    global _typed_so_far
+    """Every LIVE_PREVIEW_INTERVAL_SEC: read only the NEW raw PCM bytes since
+    the last cycle, wrap them in a fresh WAV, transcribe just that chunk, and
+    immediately type the result at cursor.  Each cycle stays O(chunk_size) so
+    transcription time never grows with recording length."""
+    global _typed_so_far, _last_typed_byte
     while not _live_stop_event.wait(LIVE_PREVIEW_INTERVAL_SEC):
         if not os.path.exists(src_wav):
             continue
         try:
-            if os.path.getsize(src_wav) < LIVE_PREVIEW_MIN_BYTES:
+            file_size   = os.path.getsize(src_wav)
+            chunk_start = _last_typed_byte
+            chunk_end   = file_size
+
+            if chunk_end - chunk_start < LIVE_PREVIEW_MIN_BYTES:
+                continue  # not enough new audio yet
+
+            with open(src_wav, 'rb') as fh:
+                fh.seek(chunk_start)
+                raw_pcm = fh.read(chunk_end - chunk_start)
+
+            if len(raw_pcm) < LIVE_PREVIEW_MIN_BYTES:
                 continue
 
             fd, snap = tempfile.mkstemp(suffix=".wav", prefix="whispr_live_")
             os.close(fd)
             try:
-                subprocess.run(
-                    ["cp", "--reflink=auto", src_wav, snap],
-                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                if os.path.getsize(snap) < LIVE_PREVIEW_MIN_BYTES:
-                    continue
-                # Non-blocking acquire: skip cycle rather than block behind final transcribe
+                _write_wav_chunk(snap, raw_pcm)
+
                 if not _transcribe_lock.acquire(blocking=False):
-                    continue
+                    continue  # final transcription starting; stop event fires shortly
                 try:
                     text = _run_transcribe(snap)
                 finally:
                     _transcribe_lock.release()
 
+                # Always advance pointer so we never re-transcribe the same silence
+                _last_typed_byte = chunk_end
+
                 if text:
-                    new = _new_suffix(text, _typed_so_far)
-                    if new:
-                        _typed_so_far += new
-                        _type_at_cursor(new)
-                        log(f"live → {new.strip()}")
+                    prefix = " " if _typed_so_far and not _typed_so_far.endswith(" ") else ""
+                    to_type = prefix + text
+                    _typed_so_far += to_type
+                    _type_at_cursor(to_type)
+                    log(f"live: {text.strip()}")
             finally:
                 try:
                     os.unlink(snap)
                 except Exception:
                     pass
-        except Exception:
+        except Exception as e:
+            log(f"live worker: {e}")
             continue
 
 
 def stop_and_transcribe():
-    """Stop recording, do a final full transcription, and type only the
-    words that the live worker hasn't already typed."""
-    global recording_proc, audio_file, _live_thread, _transcribing, _typed_so_far
+    """Stop recording.  Transcribe only the bytes the live worker hasn't typed,
+    then type them.  Falls back to clipboard on typing failure."""
+    global recording_proc, audio_file, _live_thread, _transcribing, _typed_so_far, _last_typed_byte
     if not recording_proc:
         return
 
     _transcribing = True
 
-    # Stop the live typing worker first so it doesn't race with final transcribe
+    # Stop the live worker before touching the audio file
     _live_stop_event.set()
     if _live_thread and _live_thread.is_alive():
         _live_thread.join(timeout=3)
@@ -240,39 +244,49 @@ def stop_and_transcribe():
     recording_proc = None
 
     if not audio_file or not os.path.exists(audio_file):
-        notify("", urgency="low", timeout=1, replace_id=9999)
         return
 
+    rem_wav = None
     try:
-        text = transcribe(audio_file)
+        file_size     = os.path.getsize(audio_file)
+        untyped_start = _last_typed_byte
+        untyped_bytes = file_size - untyped_start
+
+        text = ""
+        if untyped_bytes >= LIVE_PREVIEW_MIN_BYTES:
+            # Transcribe only the tail the live worker didn't cover
+            with open(audio_file, 'rb') as fh:
+                fh.seek(untyped_start)
+                raw_pcm = fh.read(untyped_bytes)
+            fd, rem_wav = tempfile.mkstemp(suffix=".wav", prefix="whispr_rem_")
+            os.close(fd)
+            _write_wav_chunk(rem_wav, raw_pcm)
+            text = transcribe(rem_wav)
+        elif not _typed_so_far:
+            # Nothing was typed live — transcribe the whole file
+            text = transcribe(audio_file)
+
         if text:
-            log(f"→ full: {text}")
-            remainder = _new_suffix(text, _typed_so_far)
-            if remainder:
-                ok = _type_at_cursor(remainder)
-                if not ok:
-                    _copy_to_clipboard(text)
-                    notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
-                    return
-            elif not _typed_so_far:
-                # Nothing typed yet at all (live worker didn't get enough audio)
-                ok = _type_at_cursor(text)
-                if not ok:
-                    _copy_to_clipboard(text)
-                    notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
-                    return
-        else:
+            log(f"final: {text}")
+            prefix = " " if _typed_so_far and not _typed_so_far.endswith(" ") else ""
+            to_type = prefix + text
+            ok = _type_at_cursor(to_type)
+            if not ok:
+                full = (_typed_so_far + to_type).strip()
+                _copy_to_clipboard(full)
+                notify("Copied to clipboard", full[:120], timeout=6000, replace_id=9999)
+        elif not _typed_so_far:
             log("No speech detected")
-        # Dismiss the recording notification silently
-        notify("", urgency="low", timeout=1, replace_id=9999)
     except Exception as e:
         log(f"Transcription error: {e}")
         notify("Transcription error", str(e), urgency="critical", timeout=6000, replace_id=9999)
     finally:
-        try:
-            os.unlink(audio_file)
-        except Exception:
-            pass
+        for path in [audio_file, rem_wav]:
+            if path:
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
         audio_file = None
         _transcribing = False
 
