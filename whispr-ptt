@@ -18,7 +18,7 @@ import threading
 import time
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
+MODEL  = "/usr/local/share/whispr/ggml-base.en.bin"
 HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
 LIVE_PREVIEW_INTERVAL_SEC = 0.8   # seconds between live typing cycles
@@ -53,6 +53,7 @@ _live_stop_event = threading.Event()
 _live_thread     = None
 _typed_so_far    = ""   # text already typed at cursor during this session
 _last_typed_byte = WAV_HDR  # byte offset up to which live worker has already typed
+_audio_fd        = None   # open file handle for parec stdout
 _transcribing    = False
 
 
@@ -155,12 +156,21 @@ def _type_at_cursor(text):
 
 # ── Audio recording ───────────────────────────────────────────────────────────
 def start_recording():
-    global recording_proc, audio_file, _live_thread, _typed_so_far, _last_typed_byte
-    fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
+    global recording_proc, audio_file, _live_thread, _typed_so_far, _last_typed_byte, _audio_fd
+    fd, audio_file = tempfile.mkstemp(suffix=".raw", prefix="whispr_")
     os.close(fd)
+    # Write a 44-byte placeholder so _last_typed_byte = WAV_HDR = 44 is correct;
+    # parec appends raw PCM after it.
+    with open(audio_file, 'wb') as f:
+        f.write(b'\x00' * WAV_HDR)
+    # parec respects --source directly via PipeWire's PulseAudio compat layer.
+    # It outputs raw s16le PCM to stdout — no WAV header.
+    _audio_fd = open(audio_file, 'ab')
     recording_proc = subprocess.Popen(
-        ["pw-record", "--target", MIC_SOURCE, "--rate=16000", "--channels=1", "--format=s16", audio_file],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        ["parec", "--source", MIC_SOURCE,
+         "--rate=16000", "--channels=1", "--format=s16le"],
+        stdout=_audio_fd,
+        stderr=subprocess.DEVNULL
     )
     _live_stop_event.clear()
     _typed_so_far    = ""
@@ -228,7 +238,7 @@ def live_typing_worker(src_wav):
 def stop_and_transcribe():
     """Stop recording.  Transcribe only the bytes the live worker hasn't typed,
     then type them.  Falls back to clipboard on typing failure."""
-    global recording_proc, audio_file, _live_thread, _transcribing, _typed_so_far, _last_typed_byte
+    global recording_proc, audio_file, _live_thread, _transcribing, _typed_so_far, _last_typed_byte, _audio_fd
     if not recording_proc:
         return
 
@@ -243,11 +253,18 @@ def stop_and_transcribe():
     recording_proc.terminate()
     recording_proc.wait()
     recording_proc = None
+    if _audio_fd:
+        try:
+            _audio_fd.close()
+        except Exception:
+            pass
+        _audio_fd = None
 
     if not audio_file or not os.path.exists(audio_file):
         return
 
     rem_wav = None
+    full_wav = None
     try:
         file_size     = os.path.getsize(audio_file)
         untyped_start = _last_typed_byte
@@ -264,8 +281,15 @@ def stop_and_transcribe():
             _write_wav_chunk(rem_wav, raw_pcm)
             text = transcribe(rem_wav)
         elif not _typed_so_far:
-            # Nothing was typed live — transcribe the whole file
-            text = transcribe(audio_file)
+            # Nothing typed live at all — wrap the whole raw PCM in a proper WAV
+            with open(audio_file, 'rb') as fh:
+                fh.seek(WAV_HDR)
+                raw_pcm = fh.read()
+            if raw_pcm:
+                fd, full_wav = tempfile.mkstemp(suffix=".wav", prefix="whispr_full_")
+                os.close(fd)
+                _write_wav_chunk(full_wav, raw_pcm)
+                text = transcribe(full_wav)
 
         if text:
             log(f"final: {text}")
@@ -282,7 +306,7 @@ def stop_and_transcribe():
         log(f"Transcription error: {e}")
         notify("Transcription error", str(e), urgency="critical", timeout=6000, replace_id=9999)
     finally:
-        for path in [audio_file, rem_wav]:
+        for path in [audio_file, rem_wav, full_wav]:
             if path:
                 try:
                     os.unlink(path)
