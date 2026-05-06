@@ -21,11 +21,12 @@ import time
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
 HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
-LIVE_PREVIEW_INTERVAL_SEC = 1.5   # seconds between live typing cycles
-LIVE_PREVIEW_MIN_BYTES = 16000    # min new bytes before transcribing a chunk (~0.5s)
+LIVE_PREVIEW_INTERVAL_SEC = 0.8   # seconds between live typing cycles
+LIVE_PREVIEW_MIN_BYTES = 12800    # min new bytes before transcribing a chunk (~0.4s)
 TOGGLE_GUARD_SEC = 0.35
 WAV_HDR = 44          # standard PCM WAV header size in bytes
 BYTES_PER_SEC = 32000 # 16kHz * 2 bytes * 1 channel
+MIC_SOURCE = "alsa_input.pci-0000_0f_00.6.analog-stereo"  # hardware mic only
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -158,7 +159,7 @@ def start_recording():
     fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
     os.close(fd)
     recording_proc = subprocess.Popen(
-        ["pw-record", "--rate=16000", "--channels=1", "--format=s16", audio_file],
+        ["pw-record", "--target", MIC_SOURCE, "--rate=16000", "--channels=1", "--format=s16", audio_file],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     _live_stop_event.clear()
