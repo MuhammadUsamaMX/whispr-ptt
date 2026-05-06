@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+whispr-ptt: Push-to-talk speech-to-text daemon
+Hold Shift+R → record audio
+Release Shift+R → transcribe → paste at cursor (or copy to clipboard)
+"""
+
+import subprocess
+import os
+import sys
+import tempfile
+import threading
+import time
+import signal
+# ── Config ────────────────────────────────────────────────────────────────────
+HOTKEY         = "Shift+R"
+MODEL          = "/usr/local/share/whispr/ggml-tiny.en.bin"
+WHISPER_SERVER = "/usr/local/bin/openwhispr-whisper-server"
+KEY_LISTENER   = "/usr/local/bin/openwhispr-key-listener"
+WHISPER_PORT   = 18080
+WHISPER_HOST   = "127.0.0.1"
+# ──────────────────────────────────────────────────────────────────────────────
+
+recording_proc = None
+audio_file     = None
+whisper_proc   = None
+lock           = threading.Lock()
+
+
+def log(msg):
+    print(f"[whispr-ptt] {msg}", flush=True)
+
+
+def start_whisper_server():
+    global whisper_proc
+    env = os.environ.copy()
+    env["GGML_VULKAN"] = "1"
+    whisper_proc = subprocess.Popen(
+        [WHISPER_SERVER, "-m", MODEL, "--host", WHISPER_HOST, "--port", str(WHISPER_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env
+    )
+    for _ in range(40):
+        try:
+            r = subprocess.run(
+                ["curl", "-sf", f"http://{WHISPER_HOST}:{WHISPER_PORT}/"],
+                capture_output=True, timeout=1
+            )
+            if r.returncode in (0, 22):
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    log(f"Whisper server ready on port {WHISPER_PORT}")
+
+
+def start_recording():
+    global recording_proc, audio_file
+    fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
+    os.close(fd)
+    recording_proc = subprocess.Popen(
+        ["pw-record", "--rate=16000", "--channels=1", "--format=s16", audio_file],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    log("Recording...")
+
+
+def stop_and_transcribe():
+    global recording_proc, audio_file
+    if not recording_proc:
+        return
+
+    recording_proc.terminate()
+    recording_proc.wait()
+    recording_proc = None
+    log("Transcribing...")
+
+    if not audio_file or not os.path.exists(audio_file):
+        return
+
+    try:
+        result = subprocess.run(
+            ["curl", "-sf",
+             f"http://{WHISPER_HOST}:{WHISPER_PORT}/inference",
+             "-F", f"file=@{audio_file}",
+             "-F", "response_format=text",
+             "-F", "language=auto"],
+            capture_output=True, text=True, timeout=60
+        )
+        # Collapse all newlines/carriage-returns into spaces so transcribed
+        # text arrives as one paragraph and never triggers accidental Enter presses
+        text = " ".join(result.stdout.split())
+        if text:
+            log(f"→ {text}")
+            paste_text(text)
+        else:
+            log("No speech detected")
+    finally:
+        try:
+            os.unlink(audio_file)
+        except Exception:
+            pass
+        audio_file = None
+
+
+def paste_text(text):
+    env = os.environ.copy()
+    env["YDOTOOL_SOCKET"] = f"/run/user/{os.getuid()}/.ydotool_socket"
+    env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
+    env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
+
+    # Always copy to clipboard as fallback
+    subprocess.run(["wl-copy", text], check=False)
+    subprocess.run(["wl-copy", "--primary", text], check=False)
+
+    # Release Shift (still physically held from hotkey) then wait for focus to settle
+    subprocess.run(["ydotool", "key", "shift:0"], env=env, check=False)
+    time.sleep(0.2)
+
+    # Type text directly via uinput — no clipboard, no Ctrl+V, no key-combo issues
+    result = subprocess.run(
+        ["ydotool", "type", "--key-delay", "8", "--", text],
+        env=env, timeout=15, check=False
+    )
+    if result.returncode == 0:
+        log("Typed at cursor")
+    else:
+        log("Copied to clipboard (ydotool type failed)")
+
+
+def on_keydown():
+    with lock:
+        if recording_proc is None:
+            start_recording()
+
+
+def on_keyup():
+    with lock:
+        t = threading.Thread(target=stop_and_transcribe, daemon=True)
+        t.start()
+
+
+def run_key_listener():
+    proc = subprocess.Popen(
+        [KEY_LISTENER, HOTKEY],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True
+    )
+    log(f"Listening for {HOTKEY} — hold to record, release to transcribe & paste")
+    for line in proc.stdout:
+        line = line.strip().lower()
+        if "key_down" in line:
+            on_keydown()
+        elif "key_up" in line:
+            on_keyup()
+    proc.wait()
+
+
+def shutdown(sig, frame):
+    global whisper_proc, recording_proc
+    log("Shutting down...")
+    if recording_proc:
+        recording_proc.terminate()
+    if whisper_proc:
+        whisper_proc.terminate()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    if not os.path.exists(MODEL):
+        log(f"ERROR: Model not found at {MODEL}")
+        sys.exit(1)
+
+    log("Starting whisper server...")
+    start_whisper_server()
+    run_key_listener()

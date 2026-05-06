@@ -1,0 +1,13 @@
+# Whisper models (large files, downloaded at install time)
+/usr/local/share/whispr/
+
+# OpenWhispr AppImage (downloaded at install time)
+*.AppImage
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+.idea/
