@@ -49,6 +49,17 @@ rm -f ~/.config/autostart/whispr-ptt.desktop
 update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
 info "Removed desktop entries"
 
+# Remove leftover OpenWhispr artifacts that can still trigger prompts/popups
+pkill -f 'OpenWhispr.AppImage|openwhispr|open-whispr' 2>/dev/null || true
+systemctl --user stop app-gnome-openwhispr-25064.scope app-gnome-openwhispr-60166.scope \
+                    app-open-whispr-25064.scope app-open-whispr-60166.scope 2>/dev/null || true
+sudo rm -f /usr/local/bin/OpenWhispr.AppImage /usr/local/bin/whispr
+rm -f ~/.local/share/applications/*open*whispr*.desktop 2>/dev/null || true
+rm -f ~/.config/autostart/*open*whispr*.desktop 2>/dev/null || true
+sudo rm -f /usr/share/applications/*open*whispr*.desktop 2>/dev/null || true
+sudo rm -f /usr/local/share/applications/*open*whispr*.desktop 2>/dev/null || true
+info "Removed leftover OpenWhispr artifacts"
+
 # Remove cache
 rm -rf ~/.cache/whispr-ptt
 info "Removed cache"
