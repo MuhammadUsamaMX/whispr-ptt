@@ -4,7 +4,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 #  whispr-ptt installer for Arch Linux
 #  Standalone — no external apps required
-#  Hold Shift+R → speak → release → text typed at cursor
+#  Press F9 → speak (text types live) → press F9 again to finish
 # ─────────────────────────────────────────────────────────────────────────────
 
 MODELS_DIR="/usr/local/share/whispr"
@@ -84,6 +84,25 @@ sudo chmod +x "$BIN_DIR/whispr-ptt"
 sudo sed -i "s|^MODEL  = .*|MODEL  = \"${MODEL_FILE}\"|" "$BIN_DIR/whispr-ptt"
 info "whispr-ptt installed to $BIN_DIR/whispr-ptt"
 
+# ── Auto-detect microphone source ────────────────────────────────────────────
+heading "Detecting microphone"
+MIC_SOURCE=""
+# Prefer a source with 'input' in the name (mic), skip monitors
+while IFS= read -r line; do
+  name=$(echo "$line" | awk '{print $2}')
+  if [[ "$name" != *".monitor"* ]]; then
+    MIC_SOURCE="$name"
+    break
+  fi
+done < <(pactl list sources short 2>/dev/null | grep -i 'input')
+
+if [[ -n "$MIC_SOURCE" ]]; then
+  info "Microphone detected: $MIC_SOURCE"
+  sudo sed -i "s|^MIC_SOURCE = .*|MIC_SOURCE = \"${MIC_SOURCE}\"|" "$BIN_DIR/whispr-ptt"
+else
+  warn "Could not auto-detect microphone. Edit MIC_SOURCE in $BIN_DIR/whispr-ptt if audio capture fails."
+fi
+
 # ── Set GGML_VULKAN globally ──────────────────────────────────────────────────
 grep -q "GGML_VULKAN" ~/.bashrc  || echo 'export GGML_VULKAN=1' >> ~/.bashrc
 [[ -f ~/.zshrc ]] && { grep -q "GGML_VULKAN" ~/.zshrc || echo 'export GGML_VULKAN=1' >> ~/.zshrc; }
@@ -138,8 +157,8 @@ echo -e "${GREEN}═════════════════════
 echo -e "${GREEN}  whispr-ptt installed successfully!        ${NC}"
 echo -e "${GREEN}════════════════════════════════════════════${NC}"
 echo ""
-echo "  Hold  Shift+R  → speak → release → text typed at cursor"
-echo "  Text also copied to clipboard as fallback."
+echo "  Press F9 → speak (text types live at cursor) → press F9 to finish"
+  echo "  Clipboard used as fallback if typing fails."
 echo ""
 warn "Re-login (or run: newgrp input) for input group to take effect."
 echo ""
