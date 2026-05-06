@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 whispr-ptt: Push-to-talk speech-to-text daemon
-Hold Shift+R → record audio
-Release Shift+R → transcribe → paste at cursor (or copy to clipboard)
+Press F9 once → record audio
+Press F9 again → transcribe → paste at cursor (or copy to clipboard on typing failure)
 
 Standalone — no external app required.
 Dependencies: python-evdev, pywhispercpp (pip), ydotool, wl-clipboard, pipewire
@@ -19,10 +19,11 @@ import time
 
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
-HOTKEY = ("shift", "r")   # (modifier, trigger_key) — both lowercase
+HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
 LIVE_PREVIEW_INTERVAL_SEC = 1.2
 LIVE_PREVIEW_MIN_BYTES = 32768
+TOGGLE_GUARD_SEC = 0.35
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -48,6 +49,7 @@ _transcribe_lock = threading.Lock()
 _live_stop_event = threading.Event()
 _live_thread     = None
 _live_last_text  = ""
+_transcribing    = False
 
 
 def log(msg):
@@ -92,7 +94,7 @@ def load_model():
             os.dup2(old_fd, 2)
             os.close(old_fd)
     log("Model ready")
-    notify("whispr-ptt ready", "Hold Shift+R to record", urgency="low", timeout=5000)
+    notify("whispr-ptt ready", "Press F9 to start/stop recording", urgency="low", timeout=5000)
 
 
 def transcribe(wav_path):
@@ -158,9 +160,11 @@ def live_preview_worker(src_wav):
 
 
 def stop_and_transcribe():
-    global recording_proc, audio_file, _live_thread
+    global recording_proc, audio_file, _live_thread, _transcribing
     if not recording_proc:
         return
+
+    _transcribing = True
 
     _live_stop_event.set()
     if _live_thread and _live_thread.is_alive():
@@ -200,6 +204,7 @@ def stop_and_transcribe():
         except Exception:
             pass
         audio_file = None
+        _transcribing = False
 
 
 # ── Text injection ────────────────────────────────────────────────────────────
@@ -244,6 +249,16 @@ def on_keyup():
         threading.Thread(target=stop_and_transcribe, daemon=True).start()
 
 
+def on_hotkey_toggle():
+    with lock:
+        if recording_proc is not None:
+            threading.Thread(target=stop_and_transcribe, daemon=True).start()
+        elif not _transcribing:
+            start_recording()
+        else:
+            notify("Still transcribing", "Please wait", urgency="low", timeout=1500, replace_id=9999)
+
+
 # ── evdev key listener ────────────────────────────────────────────────────────
 _MODIFIER_CODES = {
     "shift": {ecodes.KEY_LEFTSHIFT, ecodes.KEY_RIGHTSHIFT},
@@ -257,7 +272,7 @@ def _key_code(name):
     return getattr(ecodes, f"KEY_{name.upper()}", None)
 
 
-def find_keyboards():
+def find_keyboards(required_code=None):
     result = []
     for path in evdev.list_devices():
         try:
@@ -276,7 +291,10 @@ def find_keyboards():
             if getattr(dev.info, "bustype", None) == getattr(ecodes, "BUS_VIRTUAL", 0x06):
                 continue
 
-            if ecodes.KEY_R in caps[ecodes.EV_KEY]:
+            if required_code is not None and required_code not in caps[ecodes.EV_KEY]:
+                continue
+
+            if ecodes.KEY_R in caps[ecodes.EV_KEY] or ecodes.KEY_F9 in caps[ecodes.EV_KEY]:
                 result.append(dev)
         except Exception:
             pass
@@ -284,9 +302,65 @@ def find_keyboards():
 
 
 def run_key_listener():
-    mod_name, key_name = HOTKEY
-    mod_name = str(mod_name).strip().lower()
-    key_name = str(key_name).strip().lower()
+    hotkey_items = tuple(HOTKEY) if isinstance(HOTKEY, (tuple, list)) else (HOTKEY,)
+    hotkey_items = tuple(str(x).strip().lower() for x in hotkey_items if str(x).strip())
+
+    if len(hotkey_items) == 1:
+        key_name = hotkey_items[0]
+        toggle_code = _key_code(key_name)
+        if toggle_code is None:
+            log(f"ERROR: unknown key '{key_name}'")
+            sys.exit(1)
+
+        keyboards = find_keyboards(required_code=toggle_code)
+        if not keyboards:
+            log("ERROR: no keyboard devices found (are you in the 'input' group? run: sudo usermod -aG input $USER, then re-login)")
+            sys.exit(1)
+
+        log(f"Listening for {key_name.upper()} on {len(keyboards)} device(s) — press once to start, press again to stop/transcribe")
+        fd_map = {d.fd: d for d in keyboards}
+        last_toggle_ts = 0.0
+
+        while True:
+            try:
+                readable, _, _ = select.select(fd_map.keys(), [], [], 2.0)
+            except (ValueError, OSError):
+                keyboards = find_keyboards(required_code=toggle_code)
+                fd_map = {d.fd: d for d in keyboards}
+                continue
+
+            for fd in readable:
+                dev = fd_map[fd]
+                try:
+                    for event in dev.read():
+                        if event.type != ecodes.EV_KEY:
+                            continue
+                        if event.code != toggle_code:
+                            continue
+                        if event.value != 1:
+                            continue
+
+                        now = time.monotonic()
+                        if (now - last_toggle_ts) < TOGGLE_GUARD_SEC:
+                            continue
+                        last_toggle_ts = now
+                        on_hotkey_toggle()
+                except OSError:
+                    del fd_map[fd]
+                    if not fd_map:
+                        log("WARNING: all keyboards disappeared, reconnecting...")
+                        time.sleep(2)
+                        keyboards = find_keyboards(required_code=toggle_code)
+                        fd_map = {d.fd: d for d in keyboards}
+                    break
+
+        return
+
+    if len(hotkey_items) != 2:
+        log("ERROR: HOTKEY must be either (key,) for toggle mode or (modifier, key) for hold mode")
+        sys.exit(1)
+
+    mod_name, key_name = hotkey_items
     mod_codes    = _MODIFIER_CODES.get(mod_name, set())
     trigger_code = _key_code(key_name)
 
@@ -298,7 +372,7 @@ def run_key_listener():
         log(f"ERROR: unknown key '{key_name}'")
         sys.exit(1)
 
-    keyboards = find_keyboards()
+    keyboards = find_keyboards(required_code=trigger_code)
     if not keyboards:
         log("ERROR: no keyboard devices found (are you in the 'input' group? run: sudo usermod -aG input $USER, then re-login)")
         sys.exit(1)
