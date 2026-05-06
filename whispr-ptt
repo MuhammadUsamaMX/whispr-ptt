@@ -167,7 +167,7 @@ def start_recording():
     # It outputs raw s16le PCM to stdout — no WAV header.
     _audio_fd = open(audio_file, 'ab')
     recording_proc = subprocess.Popen(
-        ["parec", "--source", MIC_SOURCE,
+        ["parec", "--device", MIC_SOURCE,
          "--rate=16000", "--channels=1", "--format=s16le"],
         stdout=_audio_fd,
         stderr=subprocess.DEVNULL
