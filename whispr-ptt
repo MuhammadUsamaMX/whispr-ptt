@@ -21,8 +21,8 @@ import time
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
 HOTKEY = ("f9",)   # (key,) toggle mode, or (modifier, key) hold mode
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
-LIVE_PREVIEW_INTERVAL_SEC = 1.2
-LIVE_PREVIEW_MIN_BYTES = 32768
+LIVE_PREVIEW_INTERVAL_SEC = 1.5   # seconds between live preview runs
+LIVE_PREVIEW_MIN_BYTES = 16000    # ~0.5s of 16kHz s16 mono audio; preview starts early
 TOGGLE_GUARD_SEC = 0.35
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -97,12 +97,17 @@ def load_model():
     notify("whispr-ptt ready", "Press F9 to start/stop recording", urgency="low", timeout=5000)
 
 
+def _run_transcribe(wav_path):
+    """Raw transcription, caller is responsible for holding _transcribe_lock."""
+    segments = whisper_model.transcribe(wav_path)
+    raw = " ".join(s.text for s in segments)
+    return " ".join(raw.split())
+
+
 def transcribe(wav_path):
     # pywhispercpp context is not thread-safe; serialize all transcribes.
     with _transcribe_lock:
-        segments = whisper_model.transcribe(wav_path)
-    raw = " ".join(s.text for s in segments)
-    return " ".join(raw.split())   # collapse newlines → single paragraph
+        return _run_transcribe(wav_path)
 
 
 def copy_to_clipboard(text):
@@ -134,7 +139,8 @@ def live_preview_worker(src_wav):
         if not os.path.exists(src_wav):
             continue
         try:
-            if os.path.getsize(src_wav) < LIVE_PREVIEW_MIN_BYTES:
+            size = os.path.getsize(src_wav)
+            if size < LIVE_PREVIEW_MIN_BYTES:
                 continue
 
             fd, snap = tempfile.mkstemp(suffix=".wav", prefix="whispr_live_")
@@ -145,10 +151,18 @@ def live_preview_worker(src_wav):
                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if os.path.getsize(snap) < LIVE_PREVIEW_MIN_BYTES:
                     continue
-                text = transcribe(snap)
+                # Try non-blocking: if final transcription is running, skip this cycle
+                # rather than queuing up behind it.
+                acquired = _transcribe_lock.acquire(blocking=False)
+                if not acquired:
+                    continue
+                try:
+                    text = _run_transcribe(snap)
+                finally:
+                    _transcribe_lock.release()
                 if text and text != _live_last_text:
                     _live_last_text = text
-                    notify("Live", text[:120], urgency="low", timeout=1800, replace_id=9999)
+                    notify("🎙 " + text[:100], urgency="low", timeout=2000, replace_id=9999)
             finally:
                 try:
                     os.unlink(snap)
@@ -185,13 +199,14 @@ def stop_and_transcribe():
             log(f"→ {text}")
             typed = paste_text(text)
             if typed:
-                notify("Pasted", text[:120], timeout=5000, replace_id=9999)
+                # Typed successfully — clear the live preview notification silently,
+                # no extra popup needed; user sees the text appear in their app.
+                notify("", urgency="low", timeout=1, replace_id=9999)
             else:
-                copied = copy_to_clipboard(text)
-                if copied:
-                    notify("Copied to clipboard", text[:120], timeout=5000, replace_id=9999)
-                else:
-                    notify("Type/clipboard failed", urgency="critical", timeout=5000, replace_id=9999)
+                # Typing failed — fall back to clipboard and tell the user.
+                copy_to_clipboard(text)
+                notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
+                log("Copied to clipboard (typing failed)")
         else:
             log("No speech detected")
             notify("No speech detected", urgency="low", timeout=3000, replace_id=9999)
