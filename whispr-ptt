@@ -104,8 +104,12 @@ def load_model():
 
 def _run_transcribe(wav_path):
     """Raw transcription — caller must hold _transcribe_lock."""
+    import re as _re
     segments = whisper_model.transcribe(wav_path)
     raw = " ".join(s.text for s in segments)
+    # Remove whisper hallucination tokens: [BLANK_AUDIO], (upbeat music), etc.
+    raw = _re.sub(r'\[.*?\]', '', raw)          # strip [BLANK_AUDIO] [MUSIC] etc.
+    raw = _re.sub(r'\(.*?\)', '', raw)          # strip (upbeat music) (applause) etc.
     return " ".join(raw.split())
 
 
