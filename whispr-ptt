@@ -20,6 +20,7 @@ import time
 # ── Config ────────────────────────────────────────────────────────────────────
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
 HOTKEY = ("shift", "r")   # (modifier, trigger_key) — both lowercase
+RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -203,7 +204,20 @@ def find_keyboards():
         try:
             dev = InputDevice(path)
             caps = dev.capabilities()
-            if ecodes.EV_KEY in caps and ecodes.KEY_A in caps[ecodes.EV_KEY]:
+            if ecodes.EV_KEY not in caps or ecodes.KEY_A not in caps[ecodes.EV_KEY]:
+                continue
+
+            # Skip virtual/uinput devices (including ydotool) to avoid
+            # self-trigger loops from injected keystrokes.
+            name = (dev.name or "").lower()
+            if any(t in name for t in ("ydotool", "uinput", "virtual")):
+                continue
+
+            # BUS_VIRTUAL devices are synthetic input sources.
+            if getattr(dev.info, "bustype", None) == getattr(ecodes, "BUS_VIRTUAL", 0x06):
+                continue
+
+            if ecodes.KEY_R in caps[ecodes.EV_KEY]:
                 result.append(dev)
         except Exception:
             pass
@@ -227,8 +241,10 @@ def run_key_listener():
     log(f"Listening for {mod_name.capitalize()}+{key_name.upper()} on {len(keyboards)} device(s) — hold to record, release to transcribe & paste")
 
     fd_map     = {d.fd: d for d in keyboards}
+    down_counts = {}
     mod_held   = False
     trig_down  = False
+    last_hotkey_release_ts = 0.0
 
     def grab_all():
         global _grabbed_devs
@@ -285,16 +301,29 @@ def run_key_listener():
                     code  = event.code
                     value = event.value   # 0=up 1=down 2=repeat
 
+                    if value == 1:
+                        down_counts[code] = down_counts.get(code, 0) + 1
+                    elif value == 0:
+                        cur = down_counts.get(code, 0)
+                        if cur <= 1:
+                            down_counts.pop(code, None)
+                        else:
+                            down_counts[code] = cur - 1
+
                     if code in mod_codes:
-                        mod_held = value in (1, 2)
+                        mod_held = any(down_counts.get(c, 0) > 0 for c in mod_codes)
                         # If modifier released while hotkey was held, treat as key-up
-                        if value == 0 and trig_down:
+                        if value == 0 and trig_down and not mod_held:
                             trig_down = False
                             ungrab_all()
+                            last_hotkey_release_ts = time.monotonic()
                             on_keyup()
 
                     elif code == trigger_code:
+                        now = time.monotonic()
                         if value == 1 and mod_held and not trig_down:
+                            if (now - last_hotkey_release_ts) < RETRIGGER_GUARD_SEC:
+                                continue
                             trig_down = True
                             # Grab keyboards so OS never sees R repeating into the app
                             grab_all()
@@ -302,6 +331,7 @@ def run_key_listener():
                         elif value == 0 and trig_down:
                             trig_down = False
                             ungrab_all()
+                            last_hotkey_release_ts = now
                             on_keyup()
                         # value==2 (repeat) — ignored; device is grabbed so OS won't see it
 
