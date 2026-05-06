@@ -30,6 +30,7 @@ heading "Installing system dependencies"
 sudo pacman -S --noconfirm --needed \
   python python-evdev ydotool wl-clipboard \
   pipewire pipewire-pulse \
+  libnotify \
   vulkan-radeon vulkan-icd-loader 2>&1 | grep -E "installing|already installed|error" || true
 info "System dependencies installed"
 
@@ -119,6 +120,11 @@ ExecStart=/usr/local/bin/whispr-ptt
 Restart=on-failure
 RestartSec=3
 Environment=GGML_VULKAN=1
+# GNOME / Wayland session environment
+# These are the standard systemd-resolved paths for the graphical user session.
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
 WantedBy=graphical-session.target

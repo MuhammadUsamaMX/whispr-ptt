@@ -47,6 +47,29 @@ def log(msg):
     print(f"[whispr-ptt] {msg}", flush=True)
 
 
+def notify(title, body="", urgency="normal", timeout=4000, replace_id=0):
+    """Send GNOME desktop notification via notify-send."""
+    uid = os.getuid()
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR",          f"/run/user/{uid}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS",  f"unix:path=/run/user/{uid}/bus")
+    env.setdefault("WAYLAND_DISPLAY",           "wayland-0")
+    cmd = [
+        "notify-send",
+        "-a", "whispr-ptt",
+        "-u", urgency,
+        "-t", str(timeout),
+        "-i", "audio-input-microphone",
+    ]
+    if replace_id:
+        cmd += ["-r", str(replace_id)]
+    cmd.append(title)
+    if body:
+        cmd.append(body)
+    subprocess.run(cmd, env=env, check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ── Whisper model (loaded once at startup) ────────────────────────────────────
 def load_model():
     global whisper_model
@@ -62,6 +85,7 @@ def load_model():
             os.dup2(old_fd, 2)
             os.close(old_fd)
     log("Model ready")
+    notify("whispr-ptt ready", "Hold Shift+R to record", urgency="low", timeout=5000)
 
 
 def transcribe(wav_path):
@@ -80,6 +104,7 @@ def start_recording():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     log("Recording...")
+    notify("Recording...", urgency="low", timeout=30000, replace_id=9999)
 
 
 def stop_and_transcribe():
@@ -100,10 +125,13 @@ def stop_and_transcribe():
         if text:
             log(f"→ {text}")
             paste_text(text)
+            notify("Pasted", text[:120], timeout=5000, replace_id=9999)
         else:
             log("No speech detected")
+            notify("No speech detected", urgency="low", timeout=3000, replace_id=9999)
     except Exception as e:
         log(f"Transcription error: {e}")
+        notify("Transcription error", str(e), urgency="critical", timeout=6000, replace_id=9999)
     finally:
         try:
             os.unlink(audio_file)
@@ -124,11 +152,16 @@ def paste_text(text):
     subprocess.run(["wl-copy", text],             check=False)
     subprocess.run(["wl-copy", "--primary", text], check=False)
 
-    # Release Shift (still physically held from hotkey) before typing
-    subprocess.run(["ydotool", "key", "shift:0"], env=env, check=False)
-    time.sleep(0.2)
+    # Wait for focus to settle after grab release and for user to release keys.
+    # grab_all() already sent a synchronous shift:0 to the compositor, so Shift
+    # is already cleared — no need to send it again here.
+    time.sleep(0.35)
 
-    # Type directly via uinput — no Ctrl+V, no key-combo issues
+    # Safety net: clear any modifier that may have drifted (Shift, Ctrl, Alt, Super)
+    for _k in ["shift:0", "ctrl:0", "alt:0", "super:0"]:
+        subprocess.run(["ydotool", "key", _k], env=env, check=False)
+
+    # Type directly via uinput
     result = subprocess.run(
         ["ydotool", "type", "--key-delay", "8", "--", text],
         env=env, timeout=15, check=False
@@ -214,10 +247,15 @@ def run_key_listener():
         _uid = os.getuid()
         _env = os.environ.copy()
         _env["YDOTOOL_SOCKET"]  = f"/run/user/{_uid}/.ydotool_socket"
-        _env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
-        subprocess.Popen(
+        _env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+        # Use subprocess.run (blocking) so the fake key-up events are delivered
+        # to the compositor BEFORE we return.  With Popen the events could arrive
+        # hundreds of ms later, letting Wayland's auto-repeat timer fire more
+        # Shift+R keystrokes into the focused window.
+        subprocess.run(
             ["ydotool", "key", f"{key_name}:0", f"{mod_name}:0"],
             env=_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
         )
 
     def ungrab_all():
