@@ -21,6 +21,8 @@ import time
 MODEL  = "/usr/local/share/whispr/ggml-tiny.en.bin"
 HOTKEY = ("shift", "r")   # (modifier, trigger_key) — both lowercase
 RETRIGGER_GUARD_SEC = 0.45   # ignore hotkey re-fire immediately after release
+LIVE_PREVIEW_INTERVAL_SEC = 1.2
+LIVE_PREVIEW_MIN_BYTES = 32768
 # ──────────────────────────────────────────────────────────────────────────────
 
 try:
@@ -42,6 +44,10 @@ audio_file      = None
 lock            = threading.Lock()
 whisper_model   = None
 _grabbed_devs   = []   # keyboards grabbed while hotkey is held
+_transcribe_lock = threading.Lock()
+_live_stop_event = threading.Event()
+_live_thread     = None
+_live_last_text  = ""
 
 
 def log(msg):
@@ -90,28 +96,76 @@ def load_model():
 
 
 def transcribe(wav_path):
-    segments = whisper_model.transcribe(wav_path)
+    # pywhispercpp context is not thread-safe; serialize all transcribes.
+    with _transcribe_lock:
+        segments = whisper_model.transcribe(wav_path)
     raw = " ".join(s.text for s in segments)
     return " ".join(raw.split())   # collapse newlines → single paragraph
 
 
+def copy_to_clipboard(text):
+    r1 = subprocess.run(["wl-copy", text], check=False)
+    r2 = subprocess.run(["wl-copy", "--primary", text], check=False)
+    return r1.returncode == 0 and r2.returncode == 0
+
+
 # ── Audio recording ───────────────────────────────────────────────────────────
 def start_recording():
-    global recording_proc, audio_file
+    global recording_proc, audio_file, _live_thread, _live_last_text
     fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
     os.close(fd)
     recording_proc = subprocess.Popen(
         ["pw-record", "--rate=16000", "--channels=1", "--format=s16", audio_file],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    _live_stop_event.clear()
+    _live_last_text = ""
+    _live_thread = threading.Thread(target=live_preview_worker, args=(audio_file,), daemon=True)
+    _live_thread.start()
     log("Recording...")
     notify("Recording...", urgency="low", timeout=30000, replace_id=9999)
 
 
+def live_preview_worker(src_wav):
+    global _live_last_text
+    while not _live_stop_event.wait(LIVE_PREVIEW_INTERVAL_SEC):
+        if not os.path.exists(src_wav):
+            continue
+        try:
+            if os.path.getsize(src_wav) < LIVE_PREVIEW_MIN_BYTES:
+                continue
+
+            fd, snap = tempfile.mkstemp(suffix=".wav", prefix="whispr_live_")
+            os.close(fd)
+            try:
+                # Snapshot current recording for best-effort live partial decode.
+                subprocess.run(["cp", "--reflink=auto", src_wav, snap],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.path.getsize(snap) < LIVE_PREVIEW_MIN_BYTES:
+                    continue
+                text = transcribe(snap)
+                if text and text != _live_last_text:
+                    _live_last_text = text
+                    notify("Live", text[:120], urgency="low", timeout=1800, replace_id=9999)
+            finally:
+                try:
+                    os.unlink(snap)
+                except Exception:
+                    pass
+        except Exception:
+            # Live preview is best-effort; final transcription remains authoritative.
+            continue
+
+
 def stop_and_transcribe():
-    global recording_proc, audio_file
+    global recording_proc, audio_file, _live_thread
     if not recording_proc:
         return
+
+    _live_stop_event.set()
+    if _live_thread and _live_thread.is_alive():
+        _live_thread.join(timeout=2)
+    _live_thread = None
 
     recording_proc.terminate()
     recording_proc.wait()
@@ -125,8 +179,15 @@ def stop_and_transcribe():
         text = transcribe(audio_file)
         if text:
             log(f"→ {text}")
-            paste_text(text)
-            notify("Pasted", text[:120], timeout=5000, replace_id=9999)
+            typed = paste_text(text)
+            if typed:
+                notify("Pasted", text[:120], timeout=5000, replace_id=9999)
+            else:
+                copied = copy_to_clipboard(text)
+                if copied:
+                    notify("Copied to clipboard", text[:120], timeout=5000, replace_id=9999)
+                else:
+                    notify("Type/clipboard failed", urgency="critical", timeout=5000, replace_id=9999)
         else:
             log("No speech detected")
             notify("No speech detected", urgency="low", timeout=3000, replace_id=9999)
@@ -149,10 +210,6 @@ def paste_text(text):
     env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
     env["DISPLAY"]         = os.environ.get("DISPLAY", ":0")
 
-    # Always write to clipboard as fallback
-    subprocess.run(["wl-copy", text],             check=False)
-    subprocess.run(["wl-copy", "--primary", text], check=False)
-
     # Wait for focus to settle after grab release and for user to release keys.
     # grab_all() already sent a synchronous shift:0 to the compositor, so Shift
     # is already cleared — no need to send it again here.
@@ -169,8 +226,10 @@ def paste_text(text):
     )
     if result.returncode == 0:
         log("Typed at cursor")
+        return True
     else:
-        log("Copied to clipboard (ydotool type failed)")
+        log("Typing failed")
+        return False
 
 
 # ── Hotkey events ─────────────────────────────────────────────────────────────
@@ -226,8 +285,14 @@ def find_keyboards():
 
 def run_key_listener():
     mod_name, key_name = HOTKEY
+    mod_name = str(mod_name).strip().lower()
+    key_name = str(key_name).strip().lower()
     mod_codes    = _MODIFIER_CODES.get(mod_name, set())
     trigger_code = _key_code(key_name)
+
+    if not mod_codes:
+        log(f"ERROR: unknown modifier '{mod_name}'")
+        sys.exit(1)
 
     if trigger_code is None:
         log(f"ERROR: unknown key '{key_name}'")
@@ -246,6 +311,18 @@ def run_key_listener():
     trig_down  = False
     last_hotkey_release_ts = 0.0
 
+    def inject_hotkey_keyup():
+        _uid = os.getuid()
+        _env = os.environ.copy()
+        _env["YDOTOOL_SOCKET"]  = f"/run/user/{_uid}/.ydotool_socket"
+        _env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+        # Send explicit release events for trigger/modifier and both shift sides.
+        subprocess.run(
+            ["ydotool", "key", f"{key_name}:0", f"{mod_name}:0", "leftshift:0", "rightshift:0"],
+            env=_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False,
+        )
+
     def grab_all():
         global _grabbed_devs
         _grabbed_devs = []
@@ -260,19 +337,11 @@ def run_key_listener():
         # libinput, but Wayland's internal timer keeps firing. Cancel it by
         # injecting a fake key-up for the trigger key (and modifier) via ydotool.
         # This makes the compositor think the key was released → repeat stops.
-        _uid = os.getuid()
-        _env = os.environ.copy()
-        _env["YDOTOOL_SOCKET"]  = f"/run/user/{_uid}/.ydotool_socket"
-        _env.setdefault("WAYLAND_DISPLAY", "wayland-0")
         # Use subprocess.run (blocking) so the fake key-up events are delivered
         # to the compositor BEFORE we return.  With Popen the events could arrive
         # hundreds of ms later, letting Wayland's auto-repeat timer fire more
         # Shift+R keystrokes into the focused window.
-        subprocess.run(
-            ["ydotool", "key", f"{key_name}:0", f"{mod_name}:0"],
-            env=_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=2, check=False,
-        )
+        inject_hotkey_keyup()
 
     def ungrab_all():
         global _grabbed_devs
@@ -315,6 +384,7 @@ def run_key_listener():
                         # If modifier released while hotkey was held, treat as key-up
                         if value == 0 and trig_down and not mod_held:
                             trig_down = False
+                            inject_hotkey_keyup()
                             ungrab_all()
                             last_hotkey_release_ts = time.monotonic()
                             on_keyup()
@@ -330,6 +400,7 @@ def run_key_listener():
                             on_keydown()
                         elif value == 0 and trig_down:
                             trig_down = False
+                            inject_hotkey_keyup()
                             ungrab_all()
                             last_hotkey_release_ts = now
                             on_keyup()
