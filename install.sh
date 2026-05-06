@@ -130,8 +130,8 @@ info "ydotoold service enabled"
 heading "Enabling whispr-ptt service"
 cat > ~/.config/systemd/user/whispr-ptt.service << EOF
 [Unit]
-Description=whispr-ptt push-to-talk daemon (Shift+R)
-After=graphical-session.target pipewire.service ydotoold.service
+Description=whispr-ptt push-to-talk daemon
+After=pipewire.service ydotoold.service
 Wants=ydotoold.service
 
 [Service]
@@ -139,14 +139,12 @@ ExecStart=/usr/local/bin/whispr-ptt
 Restart=on-failure
 RestartSec=3
 Environment=GGML_VULKAN=1
-# GNOME / Wayland session environment
-# These are the standard systemd-resolved paths for the graphical user session.
 Environment=XDG_RUNTIME_DIR=/run/user/%U
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now whispr-ptt.service
