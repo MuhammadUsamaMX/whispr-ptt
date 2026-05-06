@@ -24,10 +24,6 @@ info "Removed service files"
 
 # Remove binaries
 sudo rm -f /usr/local/bin/whispr-ptt
-sudo rm -f /usr/local/bin/openwhispr-whisper-server
-sudo rm -f /usr/local/bin/openwhispr-key-listener
-sudo rm -f /usr/local/bin/openwhispr-fast-paste
-sudo rm -f /usr/local/bin/OpenWhispr.AppImage
 info "Removed binaries"
 
 # Remove models (ask first)
@@ -48,13 +44,13 @@ sudo udevadm control --reload-rules 2>/dev/null || true
 info "Removed udev rules"
 
 # Remove desktop entry and autostart
-rm -f ~/.local/share/applications/openwhispr.desktop
-rm -f ~/.config/autostart/openwhispr.desktop
+rm -f ~/.local/share/applications/whispr-ptt.desktop
+rm -f ~/.config/autostart/whispr-ptt.desktop
 update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
 info "Removed desktop entries"
 
 # Remove cache
-rm -rf ~/.cache/openwhispr
+rm -rf ~/.cache/whispr-ptt
 info "Removed cache"
 
 # Remove GGML_VULKAN from shell configs

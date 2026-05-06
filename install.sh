@@ -3,12 +3,10 @@ set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  whispr-ptt installer for Arch Linux
+#  Standalone — no external apps required
 #  Hold Shift+R → speak → release → text typed at cursor
 # ─────────────────────────────────────────────────────────────────────────────
 
-REPO="https://github.com/MuhammadUsamaMX/whispr-ptt"
-OPENWHISPR_VER="1.7.0"
-OPENWHISPR_URL="https://github.com/OpenWhispr/openwhispr/releases/download/v${OPENWHISPR_VER}/OpenWhispr-${OPENWHISPR_VER}-linux-x86_64.AppImage"
 MODELS_DIR="/usr/local/share/whispr"
 BIN_DIR="/usr/local/bin"
 
@@ -28,11 +26,20 @@ heading() { echo -e "\n${CYAN}══ $* ══${NC}"; }
 # ── Check Arch ────────────────────────────────────────────────────────────────
 [[ -f /etc/arch-release ]] || error "This installer is for Arch Linux only."
 
-heading "Installing dependencies"
+heading "Installing system dependencies"
 sudo pacman -S --noconfirm --needed \
-  ydotool wl-clipboard pipewire pipewire-pulse curl python \
+  python python-evdev ydotool wl-clipboard \
+  pipewire pipewire-pulse \
   vulkan-radeon vulkan-icd-loader 2>&1 | grep -E "installing|already installed|error" || true
-info "Dependencies installed"
+info "System dependencies installed"
+
+heading "Installing pywhispercpp (whisper.cpp Python bindings)"
+if python3 -c "import pywhispercpp" 2>/dev/null; then
+  info "pywhispercpp already installed"
+else
+  sudo pip install pywhispercpp --break-system-packages --quiet
+  info "pywhispercpp installed"
+fi
 
 # ── uinput kernel module ──────────────────────────────────────────────────────
 heading "Configuring uinput"
@@ -44,39 +51,6 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger /dev/uinput 2>/dev/null || true
 sudo usermod -aG input "$USER"
 info "uinput configured (re-login needed for group change)"
-
-# ── Download OpenWhispr AppImage (for whisper-server & key-listener binaries) ─
-heading "Downloading OpenWhispr AppImage"
-APPIMAGE_PATH="/usr/local/bin/OpenWhispr.AppImage"
-if [[ ! -f "$APPIMAGE_PATH" ]]; then
-  sudo curl -L --progress-bar "$OPENWHISPR_URL" -o "$APPIMAGE_PATH"
-  sudo chmod +x "$APPIMAGE_PATH"
-  info "OpenWhispr AppImage downloaded"
-else
-  info "OpenWhispr AppImage already present"
-fi
-
-# ── Extract binaries from AppImage ───────────────────────────────────────────
-heading "Extracting whisper-server and key-listener binaries"
-EXTRACT_DIR=$(mktemp -d)
-pushd "$EXTRACT_DIR" > /dev/null
-"$APPIMAGE_PATH" --appimage-extract > /dev/null 2>&1 &
-PID=$!
-echo -n "Extracting..."
-while kill -0 $PID 2>/dev/null; do echo -n "."; sleep 1; done
-echo ""
-wait $PID
-popd > /dev/null
-
-BIN_SRC="$EXTRACT_DIR/squashfs-root/resources/bin"
-sudo cp "$BIN_SRC/whisper-server-linux-x64"  "$BIN_DIR/openwhispr-whisper-server"
-sudo cp "$BIN_SRC/linux-key-listener-x64"    "$BIN_DIR/openwhispr-key-listener"
-sudo cp "$BIN_SRC/linux-fast-paste"          "$BIN_DIR/openwhispr-fast-paste" 2>/dev/null || true
-sudo cp "$BIN_SRC"/libggml*.so*              /usr/local/lib/ 2>/dev/null || true
-sudo chmod +x "$BIN_DIR/openwhispr-whisper-server" "$BIN_DIR/openwhispr-key-listener"
-sudo ldconfig
-rm -rf "$EXTRACT_DIR"
-info "Binaries extracted"
 
 # ── Pick whisper model ────────────────────────────────────────────────────────
 heading "Select Whisper model"
@@ -106,7 +80,7 @@ heading "Installing whispr-ptt"
 sudo cp "$(dirname "$0")/whispr-ptt" "$BIN_DIR/whispr-ptt"
 sudo chmod +x "$BIN_DIR/whispr-ptt"
 # Patch model path in the installed script
-sudo sed -i "s|MODEL.*=.*\".*\"|MODEL          = \"${MODEL_FILE}\"|" "$BIN_DIR/whispr-ptt"
+sudo sed -i "s|^MODEL  = .*|MODEL  = \"${MODEL_FILE}\"|" "$BIN_DIR/whispr-ptt"
 info "whispr-ptt installed to $BIN_DIR/whispr-ptt"
 
 # ── Set GGML_VULKAN globally ──────────────────────────────────────────────────
@@ -152,20 +126,6 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now whispr-ptt.service
 info "whispr-ptt service started"
-
-# ── Desktop entry ─────────────────────────────────────────────────────────────
-mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/openwhispr.desktop << 'EOF'
-[Desktop Entry]
-Name=OpenWhispr
-Exec=env GGML_VULKAN=1 /usr/local/bin/OpenWhispr.AppImage --no-sandbox
-Icon=openwhispr
-Type=Application
-Categories=Utility;AudioVideo;
-Comment=AI-powered speech-to-text
-StartupNotify=true
-EOF
-update-desktop-database ~/.local/share/applications/ 2>/dev/null || true
 
 echo ""
 echo -e "${GREEN}════════════════════════════════════════════${NC}"
