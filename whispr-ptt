@@ -40,15 +40,15 @@ except ImportError:
     sys.exit(1)
 
 # ── Globals ───────────────────────────────────────────────────────────────────
-recording_proc  = None
-audio_file      = None
-lock            = threading.Lock()
-whisper_model   = None
-_grabbed_devs   = []   # keyboards grabbed while hotkey is held
+recording_proc   = None
+audio_file       = None
+lock             = threading.Lock()
+whisper_model    = None
+_grabbed_devs    = []   # keyboards grabbed while hotkey is held
 _transcribe_lock = threading.Lock()
 _live_stop_event = threading.Event()
 _live_thread     = None
-_live_last_text  = ""
+_typed_so_far    = ""   # words already typed at cursor during this session
 _transcribing    = False
 
 
@@ -98,27 +98,70 @@ def load_model():
 
 
 def _run_transcribe(wav_path):
-    """Raw transcription, caller is responsible for holding _transcribe_lock."""
+    """Raw transcription — caller must hold _transcribe_lock."""
     segments = whisper_model.transcribe(wav_path)
     raw = " ".join(s.text for s in segments)
     return " ".join(raw.split())
 
 
 def transcribe(wav_path):
-    # pywhispercpp context is not thread-safe; serialize all transcribes.
     with _transcribe_lock:
         return _run_transcribe(wav_path)
 
 
-def copy_to_clipboard(text):
-    r1 = subprocess.run(["wl-copy", text], check=False)
-    r2 = subprocess.run(["wl-copy", "--primary", text], check=False)
-    return r1.returncode == 0 and r2.returncode == 0
+def _copy_to_clipboard(text):
+    subprocess.run(["wl-copy",            text], check=False)
+    subprocess.run(["wl-copy", "--primary", text], check=False)
+
+
+def _type_at_cursor(text):
+    """Type text at the current cursor position via ydotool."""
+    uid = os.getuid()
+    env = os.environ.copy()
+    env["YDOTOOL_SOCKET"]  = f"/run/user/{uid}/.ydotool_socket"
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    result = subprocess.run(
+        ["ydotool", "type", "--key-delay", "8", "--", text],
+        env=env, timeout=15, check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _new_suffix(full_text, typed_so_far):
+    """Return only the words whisper added since the last chunk we typed.
+
+    Compares word-by-word so minor punctuation changes in earlier words
+    don't cause double-typing.
+    """
+    if not typed_so_far:
+        return full_text
+    typed_words = typed_so_far.split()
+    full_words  = full_text.split()
+    if len(full_words) <= len(typed_words):
+        return ""
+    # Count how many leading words still match (allow punctuation drift)
+    matched = 0
+    for i, w in enumerate(typed_words):
+        if i >= len(full_words):
+            break
+        if full_words[i].lower().rstrip(".,!?;") == w.lower().rstrip(".,!?;"):
+            matched += 1
+        else:
+            break
+    # If whisper significantly revised earlier text, skip this cycle
+    if matched < max(1, len(typed_words) - 2):
+        return ""
+    new_words = full_words[len(typed_words):]
+    if not new_words:
+        return ""
+    prefix = " " if not typed_so_far.endswith(" ") else ""
+    return prefix + " ".join(new_words)
 
 
 # ── Audio recording ───────────────────────────────────────────────────────────
 def start_recording():
-    global recording_proc, audio_file, _live_thread, _live_last_text
+    global recording_proc, audio_file, _live_thread, _typed_so_far
     fd, audio_file = tempfile.mkstemp(suffix=".wav", prefix="whispr_")
     os.close(fd)
     recording_proc = subprocess.Popen(
@@ -126,90 +169,102 @@ def start_recording():
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     _live_stop_event.clear()
-    _live_last_text = ""
-    _live_thread = threading.Thread(target=live_preview_worker, args=(audio_file,), daemon=True)
+    _typed_so_far = ""
+    _live_thread = threading.Thread(target=live_typing_worker, args=(audio_file,), daemon=True)
     _live_thread.start()
     log("Recording...")
     notify("Recording...", urgency="low", timeout=30000, replace_id=9999)
 
 
-def live_preview_worker(src_wav):
-    global _live_last_text
+def live_typing_worker(src_wav):
+    """While recording: every N seconds snapshot the audio, transcribe it,
+    and immediately type at the cursor any words that are new since the last
+    chunk.  The final stop_and_transcribe() call types whatever remains."""
+    global _typed_so_far
     while not _live_stop_event.wait(LIVE_PREVIEW_INTERVAL_SEC):
         if not os.path.exists(src_wav):
             continue
         try:
-            size = os.path.getsize(src_wav)
-            if size < LIVE_PREVIEW_MIN_BYTES:
+            if os.path.getsize(src_wav) < LIVE_PREVIEW_MIN_BYTES:
                 continue
 
             fd, snap = tempfile.mkstemp(suffix=".wav", prefix="whispr_live_")
             os.close(fd)
             try:
-                # Snapshot current recording for best-effort live partial decode.
-                subprocess.run(["cp", "--reflink=auto", src_wav, snap],
-                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    ["cp", "--reflink=auto", src_wav, snap],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
                 if os.path.getsize(snap) < LIVE_PREVIEW_MIN_BYTES:
                     continue
-                # Try non-blocking: if final transcription is running, skip this cycle
-                # rather than queuing up behind it.
-                acquired = _transcribe_lock.acquire(blocking=False)
-                if not acquired:
+                # Non-blocking acquire: skip cycle rather than block behind final transcribe
+                if not _transcribe_lock.acquire(blocking=False):
                     continue
                 try:
                     text = _run_transcribe(snap)
                 finally:
                     _transcribe_lock.release()
-                if text and text != _live_last_text:
-                    _live_last_text = text
-                    notify("🎙 " + text[:100], urgency="low", timeout=2000, replace_id=9999)
+
+                if text:
+                    new = _new_suffix(text, _typed_so_far)
+                    if new:
+                        _typed_so_far += new
+                        _type_at_cursor(new)
+                        log(f"live → {new.strip()}")
             finally:
                 try:
                     os.unlink(snap)
                 except Exception:
                     pass
         except Exception:
-            # Live preview is best-effort; final transcription remains authoritative.
             continue
 
 
 def stop_and_transcribe():
-    global recording_proc, audio_file, _live_thread, _transcribing
+    """Stop recording, do a final full transcription, and type only the
+    words that the live worker hasn't already typed."""
+    global recording_proc, audio_file, _live_thread, _transcribing, _typed_so_far
     if not recording_proc:
         return
 
     _transcribing = True
 
+    # Stop the live typing worker first so it doesn't race with final transcribe
     _live_stop_event.set()
     if _live_thread and _live_thread.is_alive():
-        _live_thread.join(timeout=2)
+        _live_thread.join(timeout=3)
     _live_thread = None
 
     recording_proc.terminate()
     recording_proc.wait()
     recording_proc = None
-    log("Transcribing...")
 
     if not audio_file or not os.path.exists(audio_file):
+        notify("", urgency="low", timeout=1, replace_id=9999)
         return
 
     try:
         text = transcribe(audio_file)
         if text:
-            log(f"→ {text}")
-            typed = paste_text(text)
-            if typed:
-                # Typed successfully — clear the live preview notification silently,
-                # no extra popup needed; user sees the text appear in their app.
-                notify("", urgency="low", timeout=1, replace_id=9999)
-            else:
-                # Typing failed — fall back to clipboard and tell the user.
-                copy_to_clipboard(text)
-                notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
-                log("Copied to clipboard (typing failed)")
+            log(f"→ full: {text}")
+            remainder = _new_suffix(text, _typed_so_far)
+            if remainder:
+                ok = _type_at_cursor(remainder)
+                if not ok:
+                    _copy_to_clipboard(text)
+                    notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
+                    return
+            elif not _typed_so_far:
+                # Nothing typed yet at all (live worker didn't get enough audio)
+                ok = _type_at_cursor(text)
+                if not ok:
+                    _copy_to_clipboard(text)
+                    notify("Copied to clipboard", text[:120], timeout=6000, replace_id=9999)
+                    return
         else:
             log("No speech detected")
-            notify("No speech detected", urgency="low", timeout=3000, replace_id=9999)
+        # Dismiss the recording notification silently
+        notify("", urgency="low", timeout=1, replace_id=9999)
     except Exception as e:
         log(f"Transcription error: {e}")
         notify("Transcription error", str(e), urgency="critical", timeout=6000, replace_id=9999)
@@ -223,33 +278,23 @@ def stop_and_transcribe():
 
 
 # ── Text injection ────────────────────────────────────────────────────────────
+# _type_at_cursor() and _copy_to_clipboard() are the primary output helpers.
+# paste_text() is kept only for the legacy hold-mode path (modifier + key).
 def paste_text(text):
     uid = os.getuid()
     env = os.environ.copy()
     env["YDOTOOL_SOCKET"]  = f"/run/user/{uid}/.ydotool_socket"
-    env["WAYLAND_DISPLAY"] = os.environ.get("WAYLAND_DISPLAY", "wayland-0")
-    env["DISPLAY"]         = os.environ.get("DISPLAY", ":0")
-
-    # Wait for focus to settle after grab release and for user to release keys.
-    # grab_all() already sent a synchronous shift:0 to the compositor, so Shift
-    # is already cleared — no need to send it again here.
-    time.sleep(0.35)
-
-    # Safety net: clear any modifier that may have drifted (Shift, Ctrl, Alt, Super)
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    # Release any stuck modifier keys from the hold-mode hotkey combo
     for _k in ["shift:0", "ctrl:0", "alt:0", "super:0"]:
         subprocess.run(["ydotool", "key", _k], env=env, check=False)
-
-    # Type directly via uinput
+    time.sleep(0.3)
     result = subprocess.run(
         ["ydotool", "type", "--key-delay", "8", "--", text],
-        env=env, timeout=15, check=False
+        env=env, timeout=15, check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    if result.returncode == 0:
-        log("Typed at cursor")
-        return True
-    else:
-        log("Typing failed")
-        return False
+    return result.returncode == 0
 
 
 # ── Hotkey events ─────────────────────────────────────────────────────────────
