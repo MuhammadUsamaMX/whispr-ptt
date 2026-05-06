@@ -36,10 +36,11 @@ except ImportError:
     sys.exit(1)
 
 # ── Globals ───────────────────────────────────────────────────────────────────
-recording_proc = None
-audio_file     = None
-lock           = threading.Lock()
-whisper_model  = None
+recording_proc  = None
+audio_file      = None
+lock            = threading.Lock()
+whisper_model   = None
+_grabbed_devs   = []   # keyboards grabbed while hotkey is held
 
 
 def log(msg):
@@ -196,10 +197,30 @@ def run_key_listener():
     mod_held   = False
     trig_down  = False
 
+    def grab_all():
+        global _grabbed_devs
+        _grabbed_devs = []
+        for d in list(fd_map.values()):
+            try:
+                d.grab()
+                _grabbed_devs.append(d)
+            except Exception:
+                pass
+
+    def ungrab_all():
+        global _grabbed_devs
+        for d in _grabbed_devs:
+            try:
+                d.ungrab()
+            except Exception:
+                pass
+        _grabbed_devs = []
+
     while True:
         try:
             readable, _, _ = select.select(fd_map.keys(), [], [], 2.0)
         except (ValueError, OSError):
+            ungrab_all()
             keyboards = find_keyboards()
             fd_map = {d.fd: d for d in keyboards}
             continue
@@ -215,19 +236,27 @@ def run_key_listener():
 
                     if code in mod_codes:
                         mod_held = value in (1, 2)
+                        # If modifier released while hotkey was held, treat as key-up
+                        if value == 0 and trig_down:
+                            trig_down = False
+                            ungrab_all()
+                            on_keyup()
 
                     elif code == trigger_code:
                         if value == 1 and mod_held and not trig_down:
                             trig_down = True
+                            # Grab keyboards so OS never sees R repeating into the app
+                            grab_all()
                             on_keydown()
                         elif value == 0 and trig_down:
                             trig_down = False
+                            ungrab_all()
                             on_keyup()
-                        elif value in (1, 2):
-                            trig_down = True
+                        # value==2 (repeat) — ignored; device is grabbed so OS won't see it
 
             except OSError:
                 del fd_map[fd]
+                ungrab_all()
                 if not fd_map:
                     log("WARNING: all keyboards disappeared, reconnecting...")
                     time.sleep(2)
@@ -239,6 +268,11 @@ def run_key_listener():
 # ── Shutdown ──────────────────────────────────────────────────────────────────
 def shutdown(sig, frame):
     log("Shutting down...")
+    for d in _grabbed_devs:
+        try:
+            d.ungrab()
+        except Exception:
+            pass
     if recording_proc:
         recording_proc.terminate()
     sys.exit(0)
